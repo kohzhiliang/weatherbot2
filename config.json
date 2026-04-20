@@ -1,0 +1,16 @@
+{
+    "balance": 100.0,
+    "max_bet": 20.0,
+    "min_ev": 0.15,
+    "max_price": 0.45,
+    "min_volume": 500,
+    "min_hours": 2.0,
+    "max_hours": 72.0,
+    "kelly_fraction": 0.25,
+    "max_slippage": 0.03,
+    "scan_interval_seconds": 3600,
+    "monitor_interval_seconds": 600,
+    "vc_key": "9RWB2JET9ERMNU3BPCSD2XG6Z",
+    "polygon_wallet_pk": "",
+    "log_level": "INFO"
+}

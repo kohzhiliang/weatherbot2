@@ -1,0 +1,21 @@
+[2026-04-21 02:07:07] Watchdog active, PID=88587
+[2026-04-21 02:07:07] Bot not running
+[2026-04-21 02:07:07] Restart #1 — starting bot...
+[2026-04-21 02:07:07] === Starting weatherbot2 ===
+Weatherbot PID: 88626
+Log: logs/bot.log
+[2026-04-21 02:07:09] Bot started, PID=88626
+[2026-04-21 02:09:39] !!! Bot STUCK (no output for 150s) — killing and restarting
+[2026-04-21 02:09:39] Stopping bot PID=88626
+[2026-04-21 02:09:41] Restarting...
+[2026-04-21 02:09:41] === Starting weatherbot2 ===
+Weatherbot PID: 88756
+Log: logs/bot.log
+[2026-04-21 02:09:43] Bot started, PID=88756
+[2026-04-21 02:12:13] !!! Bot STUCK (no output for 150s) — killing and restarting
+[2026-04-21 02:12:13] Stopping bot PID=88756
+[2026-04-21 02:12:15] Restarting...
+[2026-04-21 02:12:15] === Starting weatherbot2 ===
+Weatherbot PID: 89003
+Log: logs/bot.log
+[2026-04-21 02:12:17] Bot started, PID=89003
