@@ -1,0 +1,27 @@
+# Config (contains secrets)
+config.json
+
+# Data & state
+data/
+logs/
+*.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# PIDs
+*.pid
+*.log
+
+# macOS
+.DS_Store
+
+# Hermes
+.hermes/
+
+# Environment
+.env
+.env.local
