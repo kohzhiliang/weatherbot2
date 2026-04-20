@@ -2,7 +2,7 @@
 
 Paper-trading bot for Polymarket temperature bucket markets. Trades 20 global cities using ECMWF/HRRR weather forecasts with Kelly Criterion sizing and self-calibrating probabilities.
 
-**Running:** paper mode, VPS `159.65.130.226`
+**Running:** paper mode
 
 ## Quick Start
 
@@ -40,12 +40,9 @@ bash watchdog.sh start
 
 ## Deploy
 
+Push to GitHub, then on your server:
 ```bash
-# Mac: edit code, push
-git add . && git commit -m "changes" && git push
-
-# VPS: pull
-cd /home/hermes/weatherbot2 && git pull
+git pull
 ```
 
 ## Architecture
