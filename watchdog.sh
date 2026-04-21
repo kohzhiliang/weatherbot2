@@ -4,14 +4,14 @@
 
 set -e
 
-BOT_DIR="/Users/zhiliangkoh/Desktop/weatherbot2"
+BOT_DIR="/home/hermes/weatherbot2"
 LOG_FILE="$BOT_DIR/logs/watchdog.log"
 PID_FILE="$BOT_DIR/.watchdog.pid"
 BOT_PID_FILE="$BOT_DIR/.bot.pid"
 RESTART_LOG="/tmp/weatherbot_restarts.txt"
 MAX_RESTARTS=10
 RESTART_WINDOW=300
-STALE_SECONDS=150
+STALE_SECONDS=7200
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
@@ -27,11 +27,19 @@ is_running() {
 }
 
 get_last_log_time() {
-    [ -f "$BOT_DIR/logs/bot.log" ] && stat -f %m "$BOT_DIR/logs/bot.log" 2>/dev/null || echo "0"
+    if [ -f "$BOT_DIR/logs/bot.log" ]; then
+        stat -c %Y "$BOT_DIR/logs/bot.log" 2>/dev/null || echo "0"
+    else
+        echo "0"
+    fi
 }
 
 get_last_log_size() {
-    [ -f "$BOT_DIR/logs/bot.log" ] && stat -f %s "$BOT_DIR/logs/bot.log" 2>/dev/null || echo "0"
+    if [ -f "$BOT_DIR/logs/bot.log" ]; then
+        stat -c %s "$BOT_DIR/logs/bot.log" 2>/dev/null || echo "0"
+    else
+        echo "0"
+    fi
 }
 
 start_bot() {

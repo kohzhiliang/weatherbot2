@@ -1,5 +1,6 @@
 """SQLite-backed persistent state — positions, balance, calibration, history."""
-import sqlite3, json, logging
+import sqlite3, logging
+from .forecast import LOCATIONS
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
@@ -50,6 +51,30 @@ class StateDB:
                 conn.execute("ALTER TABLE positions ADD COLUMN nws_forecast REAL")
             except sqlite3.OperationalError:
                 pass  # column already exists
+            # Migration: add forecast_src to resolved for calibration tracking
+            try:
+                conn.execute("ALTER TABLE resolved ADD COLUMN forecast_src TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+            try:
+                conn.execute("ALTER TABLE resolved ADD COLUMN nws_forecast REAL")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+            # Migration: add stop_price for trailing stop persistence
+            try:
+                conn.execute("ALTER TABLE positions ADD COLUMN stop_price REAL")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+            # Migration: add side field (BUY vs SELL) — ColdMath strategy uses both
+            try:
+                conn.execute("ALTER TABLE positions ADD COLUMN side TEXT DEFAULT 'BUY'")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+            # Migration: add side to resolved too
+            try:
+                conn.execute("ALTER TABLE resolved ADD COLUMN side TEXT DEFAULT 'BUY'")
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
     # ---- balance ----
     def get_balance(self) -> float:
@@ -82,8 +107,9 @@ class StateDB:
             conn.execute("""
                 INSERT INTO positions
                 (id, city, date, bucket_low, bucket_high, entry_price, shares, cost,
-                 p, ev, kelly, forecast_temp, forecast_src, nws_forecast, opened_at, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
+                 p, ev, kelly, forecast_temp, forecast_src, nws_forecast,
+                 opened_at, status, side)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
             """, (
                 pos["id"], pos["city"], pos["date"],
                 pos["bucket_low"], pos["bucket_high"],
@@ -91,7 +117,8 @@ class StateDB:
                 pos["p"], pos["ev"], pos["kelly"],
                 pos["forecast_temp"], pos["forecast_src"],
                 pos.get("nws_forecast"),
-                datetime.now(timezone.utc).isoformat()
+                datetime.now(timezone.utc).isoformat(),
+                pos.get("side", "BUY"),
             ))
         bal = self.get_balance()
         self.update_balance(bal - pos["cost"], f"open:{pos['id']}")
@@ -112,8 +139,24 @@ class StateDB:
             shares = pos_dict["shares"]
             cost = pos_dict["cost"]
             entry = pos_dict["entry_price"]
-            pnl = round((exit_price - entry) * shares, 2)
-            new_balance = self.get_balance() + cost + pnl
+            side = pos_dict.get("side", "BUY")
+
+            # BUY:  cost = shares × entry (positive = we PAID at open)
+            #        balance at open: bal - cost  (deducted)
+            #        pnl = (exit - entry) × shares
+            #        close: return cost (unused) + pnl
+            #
+            # SELL: cost = shares × entry (POSITIVE in positions, even for SELL)
+            #        balance at open: bal + cost  (premium ADDED to balance)
+            #        pnl = shares × (2×entry - 1) if YES wins
+            #            = shares × entry       if NO wins (we kept premium)
+            #        close: DEDUCT premium + pnl = -(cost) + pnl
+            if side == "SELL":
+                pnl = shares * (2.0 * entry - 1.0) if exit_price >= 0.95 else shares * entry
+            else:  # BUY
+                pnl = round((exit_price - entry) * shares, 2)
+
+            new_balance = self.get_balance() - cost + pnl
             self.update_balance(new_balance, f"close:{reason}:{pos_id}")
 
             conn.execute(
@@ -122,16 +165,78 @@ class StateDB:
             conn.execute("""
                 INSERT INTO resolved
                 (id, city, date, bucket_low, bucket_high, entry_price, exit_price,
-                 shares, cost, resolved_outcome, pnl, resolved_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 shares, cost, resolved_outcome, pnl, resolved_at,
+                 forecast_src, nws_forecast, side)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 pos_id, pos_dict["city"], pos_dict["date"],
                 pos_dict["bucket_low"], pos_dict["bucket_high"],
                 entry, exit_price, shares, cost,
                 "win" if pnl > 0 else "loss", pnl,
-                datetime.now(timezone.utc).isoformat()
+                datetime.now(timezone.utc).isoformat(),
+                pos_dict.get("forecast_src"),
+                pos_dict.get("nws_forecast"),
+                side,
             ))
+
+            # ---- Calibration: update sigma from this resolve ----
+            # ---- Calibration: update sigma from this resolve ----
+            src = pos_dict.get("forecast_src")
+            if src and pos_dict.get("forecast_temp") is not None and exit_price is not None:
+                bucket_width = abs(pos_dict["bucket_high"] - pos_dict["bucket_low"])
+                bucket_mid = (pos_dict["bucket_low"] + pos_dict["bucket_high"]) / 2.0
+                if bucket_mid == -999:
+                    bucket_mid = pos_dict["bucket_high"]  # unbounded bucket
+                fcst = pos_dict["forecast_temp"]
+                raw_error = abs(fcst - bucket_mid)
+                # Minimum error floor: prevent wins on single-degree buckets (where
+                # fcst == bucket_mid exactly) from driving sigma toward zero.
+                # A win means we were in the right bucket — but actual could have been
+                # anywhere within it; credit at least half a bucket width.
+                min_error = max(0.5, bucket_width / 2.0)
+                error = max(raw_error, min_error)
+                self._update_calibration_from_error(conn, pos_dict["city"], src, error)
+                log.debug(
+                    "[CALIB] %s %s sigma update: raw_error=%.1f min_error=%.1f final_error=%.1f city=%s src=%s",
+                    pos_dict["city"], pos_dict["date"], raw_error, min_error, error, pos_dict["city"], src
+                )
         log.info("Closed position %s exit=%.3f pnl=%s", pos_id, exit_price, pnl)
+
+    def _update_calibration_from_error(self, conn: sqlite3.Connection,
+                                        city: str, source: str, error: float):
+        """
+        Update rolling sigma using exponential moving average.
+        Starts from default sigma (2.0°F US, 1.2°C international).
+        """
+        loc = LOCATIONS.get(city, {})
+        unit = loc.get("unit", "F")
+        default_sigma = 2.0 if unit == "F" else 1.5
+        alpha = 0.25  # faster convergence — gets within 10% of true sigma in ~15 resolves
+
+        row = conn.execute(
+            "SELECT sigma, n FROM calibration WHERE city=? AND source=?",
+            (city, source)
+        ).fetchone()
+        if row and row[0] is not None and row[1] is not None and row[1] > 0:
+            sigma = row[0]
+            n = row[1]
+            new_sigma = sigma + alpha * (error - sigma)
+            conn.execute("""
+                INSERT INTO calibration (city, source, sigma, n, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(city, source) DO UPDATE SET
+                    sigma=excluded.sigma, n=excluded.n, updated_at=excluded.updated_at
+            """, (city, source, round(new_sigma, 3), n + 1,
+                  datetime.now(timezone.utc).isoformat()))
+        else:
+            # Seed with default sigma on first resolve
+            conn.execute("""
+                INSERT INTO calibration (city, source, sigma, n, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(city, source) DO UPDATE SET
+                    sigma=excluded.sigma, n=excluded.n, updated_at=excluded.updated_at
+            """, (city, source, default_sigma, 1,
+                  datetime.now(timezone.utc).isoformat()))
 
     def get_open_positions(self) -> list[dict]:
         with sqlite3.connect(self.db_path) as conn:
@@ -148,6 +253,15 @@ class StateDB:
             ).fetchall()
             cols = [desc[0] for desc in conn.execute("SELECT * FROM resolved WHERE 1=0").description]
             return [dict(zip(cols, r)) for r in rows]
+
+    # ---- Trailing stop persistence ----
+    def update_stop_price(self, pos_id: str, stop_price: float):
+        """Persist a new stop_price after trailing stop fires."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE positions SET stop_price=? WHERE id=? AND status='open'",
+                (round(stop_price, 4), pos_id)
+            )
 
     # ---- calibration ----
     def get_calibration(self, city: str, source: str) -> Optional[float]:
@@ -171,31 +285,43 @@ class StateDB:
     def record_nws_bias(self, city: str, actual_temp: float,
                         nws_forecast: float | None, model_forecast: float | None):
         """
-        Record forecast error after market resolution.
-        - nws_error = actual - nws_forecast (positive = NWS underforecasts, NWS has cold bias)
+        Record forecast errors after market resolution.
+        - nws_error = actual - nws_forecast (positive = NWS underforecasts/warm bias)
         - model_error = actual - model_forecast (positive = model underforecasts)
         Monthly buckets capture seasonal bias shifts.
+        Always records what it can — never short-circuits with early return.
         """
-        if nws_forecast is None:
-            return
         month = datetime.now(timezone.utc).month
-        nws_error = actual_temp - nws_forecast
-        model_error = 0.0
+        ts = datetime.now(timezone.utc).isoformat()
+
+        nws_error = None
+        if nws_forecast is not None:
+            nws_error = actual_temp - nws_forecast
+
+        model_error = None
         if model_forecast is not None:
             model_error = actual_temp - model_forecast
-        ts = datetime.now(timezone.utc).isoformat()
+
         with sqlite3.connect(self.db_path) as conn:
-            # Upsert NWS error
-            conn.execute("""
-                INSERT INTO nws_bias (city, month, nws_error_sum, nws_error_n, nws_biased_sum, nws_biased_n, updated_at)
-                VALUES (?, ?, ?, 1, ?, 1, ?)
-                ON CONFLICT(city, month) DO UPDATE SET
-                    nws_error_sum = nws_error_sum + excluded.nws_error_sum,
-                    nws_error_n = nws_error_n + 1,
-                    nws_biased_sum = nws_biased_sum + excluded.nws_biased_sum,
-                    nws_biased_n = nws_biased_n + 1,
-                    updated_at = excluded.updated_at
-            """, (city, month, nws_error, model_error, ts))
+            if nws_error is not None:
+                conn.execute("""
+                    INSERT INTO nws_bias (city, month, nws_error_sum, nws_error_n, nws_biased_sum, nws_biased_n, updated_at)
+                    VALUES (?, ?, ?, 1, 0, 0, ?)
+                    ON CONFLICT(city, month) DO UPDATE SET
+                        nws_error_sum = nws_error_sum + excluded.nws_error_sum,
+                        nws_error_n = nws_error_n + 1,
+                        updated_at = excluded.updated_at
+                """, (city, month, nws_error, ts))
+
+            if model_error is not None:
+                conn.execute("""
+                    INSERT INTO nws_bias (city, month, nws_error_sum, nws_error_n, nws_biased_sum, nws_biased_n, updated_at)
+                    VALUES (?, ?, 0, 0, ?, 1, ?)
+                    ON CONFLICT(city, month) DO UPDATE SET
+                        nws_biased_sum = nws_biased_sum + excluded.nws_biased_sum,
+                        nws_biased_n = nws_biased_n + 1,
+                        updated_at = excluded.updated_at
+                """, (city, month, model_error, ts))
 
     def get_nws_bias(self, city: str, month: int | None = None) -> dict | None:
         """Get average NWS bias for city. If month not specified, use current month."""

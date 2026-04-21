@@ -97,7 +97,7 @@ class PolymarketClient:
                     "id": m["id"],
                     "question": question,
                     "range": parse_temp_range(question),
-                    "date": m.get("date"),
+                    "date": m.get("endDate", ""),  # use endDate for resolution time reference
                     "bid": round(bid, 4),
                     "ask": round(ask, 4),
                     "spread": round(ask - bid, 4),

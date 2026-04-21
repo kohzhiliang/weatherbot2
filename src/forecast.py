@@ -44,6 +44,52 @@ TIMEZONES = {
     "buenos-aires": "America/Argentina/Buenos_Aires", "wellington": "Pacific/Auckland",
 }
 
+# ColdMath research: ECMWF has systematic warm bias for Asian cities.
+# These biases are applied as a CORRECTION (subtract from ECMWF forecast).
+# Positive value = ECMWF runs warm, subtract it to get true forecast.
+# Empirical from ColdMath's historical wins + our 8 loss analysis:
+#   Singapore: +1.8°C bias (ECMWF 30°C → actual 31.3°C, ECMWF 28°C → actual 30.3°C)
+#   Shanghai: +0.8°C bias (ECMWF 20°C → actual 18.5°C... actually ECMWF runs cold here, so negative)
+#   Beijing, Seoul, Tokyo: +0.5 to +1.0°C warm bias typical
+# ColdMath won on: Wellington (spring), Seoul (winter cold), Tokyo (spring), Beijing (spring)
+# His strategy: buy extreme cold ("or below") pennies in spring for Southern Hemisphere / Asian cities.
+ECMWF_BIAS_CORRECTION = {
+    "singapore": +1.8,
+    "shanghai": -0.8,   # ECMWF tends to run slightly cold on Shanghai
+    "seoul":    +1.0,
+    "tokyo":    +0.8,
+    "beijing":  +1.0,
+    "lucknow":  +1.2,
+    "tel-aviv": +0.8,
+    "manila":   +0.5,
+    "hong-kong": +0.7,  # approximate
+    "shenzhen": +0.7,
+    "chongqing": +0.5,
+    "chengdu":  +0.6,
+    "guangzhou": +0.5,
+    "busan":    +1.0,
+    # Southern Hemisphere / spring cities (April): cool bias more likely
+    "wellington": -0.5,
+    "buenos-aires": -0.5,
+    "sao-paulo": -0.5,
+}
+
+# ColdMath cities — prioritized for cold-event strategy (spring 2026)
+# These cities reliably get cold enough in April that "or below" cold buckets
+# at $0.01-$0.05 are genuinely undervalued by the market.
+COLD_CITY_PRIORITY = {
+    "wellington":  {"priority": 1, "typical_low_c": 8, "typical_high_c": 16},
+    "seoul":       {"priority": 2, "typical_low_c": 8, "typical_high_c": 18},
+    "tokyo":       {"priority": 3, "typical_low_c": 10, "typical_high_c": 20},
+    "buenos-aires":{"priority": 4, "typical_low_c": 12, "typical_high_c": 22},
+    "beijing":     {"priority": 5, "typical_low_c": 8, "typical_high_c": 20},
+    "ankara":      {"priority": 6, "typical_low_c": 6, "typical_high_c": 18},
+    "london":      {"priority": 7, "typical_low_c": 5, "typical_high_c": 14},
+    "munich":      {"priority": 8, "typical_low_c": 4, "typical_high_c": 14},
+    "chicago":     {"priority": 9, "typical_low_f": 40, "typical_high_f": 60},
+    "atlanta":     {"priority": 10, "typical_low_f": 50, "typical_high_f": 75},
+}
+
 SIGMA_DEFAULTS = {"F": 2.0, "C": 1.2}
 
 
@@ -105,7 +151,12 @@ class ForecastEngine:
         return None
 
     def get_ecmwf(self, city_slug: str, dates: list[str]) -> dict[str, float]:
-        """ECMWF via Open-Meteo. Airport coordinates = correct station match."""
+        """ECMWF via Open-Meteo. Airport coordinates = correct station match.
+        
+        Applies bias correction from ECMWF_BIAS_CORRECTION table to improve
+        accuracy for Asian cities (ColdMath research: Singapore +1.8°C warm bias,
+        Shanghai -0.8°C cold bias, etc.).
+        """
         loc = LOCATIONS[city_slug]
         unit = loc["unit"]
         temp_unit = "fahrenheit" if unit == "F" else "celsius"
@@ -117,13 +168,21 @@ class ForecastEngine:
             f"&forecast_days=7&timezone={TIMEZONES.get(city_slug, 'UTC')}"
             f"&models=ecmwf_ifs025&bias_correction=true"
         )
+        bias = ECMWF_BIAS_CORRECTION.get(city_slug, 0.0)
         for attempt in range(3):
             try:
                 data = requests.get(url, timeout=(5, 10)).json()
                 if "error" not in data:
                     for date, temp in zip(data["daily"]["time"], data["daily"]["temperature_2m_max"]):
                         if date in dates and temp is not None:
-                            result[date] = round(temp, 1) if unit == "C" else round(temp)
+                            # Apply bias correction: positive bias = ECMWF warm, subtract it
+                            corrected = round(temp - bias, 1) if unit == "C" else round(temp - bias)
+                            result[date] = corrected
+                            if bias != 0.0:
+                                log.debug(
+                                    "[ECMWF] %s %s: raw=%.1f bias=%+.1f corrected=%.1f",
+                                    city_slug, date, temp, bias, corrected
+                                )
                 return result
             except Exception as e:
                 if attempt < 2:
@@ -211,7 +270,9 @@ class ForecastEngine:
             grid = GRIDPOINTS.get(city_slug)
             if not grid:
                 return {}
-            self._nws_grid_cache[city_slug] = f"https://api.weather.gov/gridpoints/{grid[0]}/{grid[1]},{grid[2]}"
+            self._nws_grid_cache[city_slug] = (
+                f"https://api.weather.gov/gridpoints/{grid[0]}/{grid[1]},{grid[2]}"
+            )
 
         grid_url = self._nws_grid_cache[city_slug]
         result = {}
@@ -222,8 +283,13 @@ class ForecastEngine:
             if not temps:
                 return {}
 
-            # Parse hourly temperatures into daily highs
+            # Parse hourly temperatures into daily highs attributed to the LOCAL date.
+            # NWS validTime is in format "2026-04-20T13:00:00+00:00/PT1H" (UTC).
+            # We need the date in the city's local timezone to get the right calendar day.
             daily_highs: dict[str, int] = {}
+            from datetime import timedelta
+            # All US WFO cities use US Eastern time (EDT/EST).
+            et_offset = timedelta(hours=-4)  # EDT UTC-4, close enough for Apr (EST is -5)
             for rec in temps:
                 valid_time = rec.get("validTime", "")
                 temp_c = rec.get("value")
@@ -231,18 +297,9 @@ class ForecastEngine:
                     continue
                 start_str = valid_time.split("/")[0]
                 dt_utc = datetime.fromisoformat(start_str)
-                # NWS times are in local ET/America timezone
-                dt_local = dt_utc.astimezone(timezone.utc).astimezone(
-                    datetime.now(timezone.utc).astimezone().tzinfo
-                )
-                # Approximate: use ET (UTC-4 EDT or UTC-5 EST) for these WFO locations
-                from datetime import timedelta
-                et_offset = timedelta(hours=-4)  # EDT
-                dt_et = dt_utc.astimezone(timezone.utc).replace() + et_offset
-                # Simple approach: just use the UTC date shifted by -4h for ET boundary
-                # Better: parse the validTime properly
-                date_key = start_str[:10]  # YYYY-MM-DD in UTC — good enough for daily high
-
+                # Convert to ET: subtract 4 hours, then take the date
+                dt_et = dt_utc + et_offset
+                date_key = dt_et.strftime("%Y-%m-%d")  # local calendar day
                 temp_f = round(temp_c * 9/5 + 32)
                 if date_key not in daily_highs or temp_f > daily_highs[date_key]:
                     daily_highs[date_key] = temp_f

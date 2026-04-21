@@ -1,13 +1,16 @@
 """Main scanning engine — orchestrates forecast + market data into trading decisions."""
-import logging, time
+import logging, sqlite3, time, re
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .config import Config
-from .forecast import ForecastEngine, LOCATIONS
+from .forecast import (
+    ForecastEngine, LOCATIONS, COLD_CITY_PRIORITY,
+    ECMWF_BIAS_CORRECTION
+)
 from .polymarket import PolymarketClient, hours_to_resolution
-from .betsizing import bucket_prob, calc_ev, calc_kelly, bet_size
+from .betsizing import bucket_prob, calc_ev, calc_kelly, bet_size, calc_kelly_penny
 from .state import StateDB
 
 log = logging.getLogger(__name__)
@@ -22,6 +25,41 @@ METAR_CACHE_TTL = 300  # 5 minutes — METAR doesn't change fast
 
 # In-memory METAR cache keyed by city_slug
 _metar_cache: dict[str, tuple[float, float]] = {}  # {city_slug: (temp, cached_at)}
+
+# City alias normalization — all aliases map to one canonical key in LOCATIONS
+CITY_ALIASES = {
+    "nyc": "nyc",
+    "new-york-city": "nyc",
+    "new-york": "nyc",
+    "newyork": "nyc",
+    "chicago": "chicago",
+    "miami": "miami",
+    "dallas": "dallas",
+    "seattle": "seattle",
+    "atlanta": "atlanta",
+    "london": "london",
+    "paris": "paris",
+    "munich": "munich",
+    "ankara": "ankara",
+    "seoul": "seoul",
+    "tokyo": "tokyo",
+    "shanghai": "shanghai",
+    "singapore": "singapore",
+    "lucknow": "lucknow",
+    "tel-aviv": "tel-aviv",
+    "toronto": "toronto",
+    "sao-paulo": "sao-paulo",
+    "buenos-aires": "buenos-aires",
+    "wellington": "wellington",
+}
+
+
+def normalize_city(city_slug: str) -> str:
+    """Return canonical city slug, resolving all aliases to the canonical key."""
+    canonical = CITY_ALIASES.get(city_slug, city_slug)
+    if canonical not in LOCATIONS:
+        return city_slug  # fallback: return as-is
+    return canonical
 
 
 class Scanner:
@@ -45,6 +83,12 @@ class Scanner:
         dates = [(now + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(4)]
 
         open_pos_ids = {p["id"] for p in self.state.get_open_positions()}
+        # Build lookup of (normalized_city, bucket) -> pos_id for cross-city dedup
+        # e.g. "new-york-city [46,47)" and "nyc [46,47)" both normalize to ("nyc", (46,47))
+        open_buckets: dict[tuple[str, tuple], str] = {}
+        for p in self.state.get_open_positions():
+            norm = normalize_city(p["city"])
+            open_buckets[(norm, (p["bucket_low"], p["bucket_high"]))] = p["id"]
 
         # Phase 1: Pre-check Polymarket markets — which cities have active markets?
         # This runs first so we skip forecast fetches for cities with nothing to trade
@@ -57,17 +101,31 @@ class Scanner:
         # Phase 3: Process each city — evaluate forecasts against markets
         new_pos, closed, resolved = 0, 0, 0
 
+        # Also skip market IDs already in resolved table (they may appear under
+        # multiple city sections in the Polymarket API)
+        with sqlite3.connect(self.state.db_path) as conn:
+            recently_resolved = set(r[0] for r in conn.execute(
+                "SELECT id FROM resolved WHERE resolved_at > datetime('now', '-7 days')"))
+        skip_ids = open_pos_ids | recently_resolved
+        # Track newly-closed IDs so we don't try to re-open them in later cities
+        newly_closed_ids: set[str] = set()
+
         for city_slug, snaps in city_forecasts.items():
             if time.time() - scan_start > SCAN_TIMEOUT:
                 log.warning("[SCAN] Timeout at %s — stopping", city_slug)
                 break
 
             loc = LOCATIONS[city_slug]
-            pos_result = self._process_city(city_slug, loc, dates, snaps, open_pos_ids)
+            pos_result = self._process_city(
+                city_slug, loc, dates, snaps, skip_ids, open_buckets, newly_closed_ids)
             if pos_result:
                 new_c, closed_c = pos_result
                 new_pos += new_c
                 closed += closed_c
+            # Add any positions that were closed this scan to the skip set
+            # so subsequent cities don't try to re-evaluate them as new signals
+            for pos_id in list(newly_closed_ids):
+                skip_ids.add(pos_id)
 
         # Check for resolved markets (single-threaded, fast)
         for pos in self.state.get_open_positions():
@@ -177,6 +235,7 @@ class Scanner:
 
         now = datetime.now(timezone.utc)
         today = now.strftime("%Y-%m-%d")
+        disabled = set(self.cfg.disabled_sources)
 
         for date_str in dates:
             metar = None
@@ -185,14 +244,14 @@ class Scanner:
 
             # Source priority for best forecast: HRRR > ECMWF > METAR
             # NWS is kept separate — used as settlement anchor and market reference
-            if loc["unit"] == "F" and hrrr.get(date_str) is not None:
+            # Skip any source in disabled_sources (e.g. metar)
+            best, best_src = None, None
+            if loc["unit"] == "F" and hrrr.get(date_str) is not None and "hrrr" not in disabled:
                 best, best_src = hrrr[date_str], "hrrr"
-            elif ecmwf.get(date_str) is not None:
+            elif ecmwf.get(date_str) is not None and "ecmwf" not in disabled:
                 best, best_src = ecmwf[date_str], "ecmwf"
-            elif metar is not None:
+            elif metar is not None and "metar" not in disabled:
                 best, best_src = metar, "metar"
-            else:
-                best, best_src = None, None
 
             snapshots[date_str] = {
                 "ecmwf": ecmwf.get(date_str),
@@ -224,7 +283,9 @@ class Scanner:
     # -------------------------------------------------------------------------
 
     def _process_city(self, city_slug: str, loc: dict, dates: list[str],
-                     snaps: dict, open_pos_ids: set[str]) -> Optional[tuple[int, int]]:
+                     snaps: dict, skip_ids: set[str],
+                     open_buckets: dict[tuple[str, tuple], str],
+                     newly_closed_ids: set[str]) -> Optional[tuple[int, int]]:
         """Process one city's forecasts and find trade signals."""
         new_pos, closed = 0, 0
 
@@ -244,16 +305,17 @@ class Scanner:
 
             hours_left = hours_to_resolution(markets[0]["end_date"]) if markets else 0
 
-            if markets[0]["id"] in open_pos_ids:
-                # Monitor existing position
+            if markets[0]["id"] in skip_ids:
+                # Monitor existing position (or it was just closed this scan)
                 c = self._check_close(markets[0]["id"], forecast_temp, markets, loc, snap)
                 if c:
                     closed += c
+                    newly_closed_ids.add(markets[0]["id"])
             else:
                 # Open new position
                 if hours_left < self.cfg.min_hours or hours_left > self.cfg.max_hours:
                     continue
-                sig = self._find_signal(city_slug, forecast_temp, markets, best_src, loc, hours_left, snap)
+                sig = self._find_signal(city_slug, forecast_temp, markets, best_src, loc, hours_left, snap, open_buckets)
                 if sig:
                     ok = self.state.open_position(sig)
                     if ok:
@@ -269,24 +331,58 @@ class Scanner:
         return (new_pos, closed) if (new_pos or closed) else None
 
     def _find_signal(self, city_slug: str, forecast_temp: float, markets: list[dict],
-                     best_src: str, loc: dict, hours_left: float, snap: dict) -> Optional[dict]:
-        """
-        Find the best tradeable bucket for a forecast.
+                     best_src: str, loc: dict, hours_left: float, snap: dict,
+                     open_buckets: dict[tuple[str, tuple], str]) -> Optional[dict]:
+    """
+    ColdMath-inspired strategy: three distinct signal types.
 
-        NWS deviation signal: if our best_source forecast deviates from NWS by 2°F+,
-        the market may be anchored to NWS and mispriced. We boost EV in that case.
-        The article notes: NWS is the settlement authority — market anchors to it.
-        If HRRR/ECMWF diverges from NWS by 2°F+, that's a signal the market hasn't
-        caught up yet.
-        """
+    1. CONVICTION BUY (primary): Buy HIGH_MAX / LOW_MIN markets at $0.70–$0.99.
+       ColdMath's core edge: high-probability entries on directional range bets.
+       Example: "Will the highest temp be ≥ 25°C?" at $0.90.
+       Sizing: up to $50 max_bet, matching high conviction.
+       Entry price must be ≥ min_price_buy = $0.30.
+
+    2. COLD-EVENT BUY (secondary): Buy extremely cheap "X°C or below" buckets
+       at $0.01-$0.08 for ColdMath-priority cities in spring. These have
+       genuine edge because the market underestimates cold weather reliability.
+
+    3. NARROW-BUCKET SELL (tertiary): Sell expensive single-degree buckets
+       at $0.85+ where our forecast is confidently OUTSIDE the bucket.
+       ColdMath's biggest wins came from selling narrow buckets others over-bought.
+       Max loss is capped at ~15% of premium collected.
+
+    Bucket rules:
+    - Single-degree buckets (width ≤ 1°F/1°C): NEVER BUY, only SELL if price ≥ $0.85
+    - "Or below" / "or higher" range buckets: preferred for BUY at cheap prices
+    - Between X-Y range buckets: OK to BUY at cheap prices
+    - All BUY entries must have ask ≥ min_price_buy ($0.30)
+
+    NWS deviation signal: if our best_source forecast deviates from NWS by 2°F+,
+    the market may be anchored to NWS and mispriced. We boost EV in that case.
+    """
         unit = loc["unit"]
         sigma = self.state.get_calibration(city_slug, best_src)
-        sigma = sigma or (2.0 if unit == "F" else 1.2)
+        default_sigma = 2.0 if unit == "F" else 1.5
+        sigma = sigma or default_sigma
+
+        # Minimum sigma floor: prevents single-degree buckets from producing >~45% probability
+        # which in turn prevents EV explosions on near-$0 market prices.
+        MIN_SIGMA = {"F": 1.0, "C": 1.5}
+        sigma = max(sigma, MIN_SIGMA.get(unit, 1.5))
 
         nws_temp = snap.get("nws")
         nws_deviation = 0
         if nws_temp is not None and forecast_temp is not None:
-            nws_deviation = forecast_temp - nws_temp  # positive = our model warmer than NWS
+            nws_deviation = forecast_temp - nws_temp
+
+        # ---- Apply ECMWF bias correction for Asia cities ----
+        # This is already done in get_ecmwf(), but we re-apply here using
+        # the corrected forecast so the signal logic uses accurate temps.
+        bias = ECMWF_BIAS_CORRECTION.get(city_slug, 0.0)
+        fc_temp = forecast_temp - bias  # corrected forecast
+
+        # ---- Collect all buckets and evaluate ----
+        candidates: list[dict] = []
 
         for m in markets:
             rng = m.get("range")
@@ -296,63 +392,221 @@ class Scanner:
             bid, ask = m["bid"], m["ask"]
             spread = m.get("spread", 0)
             volume = m.get("volume", 0)
+            question = m.get("question", "")
 
             if volume < self.cfg.min_volume:
                 continue
             if spread > self.cfg.max_slippage:
                 continue
-            if ask > self.cfg.max_price:
-                continue
-            if not (t_low <= float(forecast_temp) <= t_high):
-                continue
 
-            p = bucket_prob(forecast_temp, t_low, t_high, sigma)
-            ev = calc_ev(p, ask)
+            bucket_width = abs(t_high - t_low)
+            is_single_degree = bucket_width <= 1.0
+            is_or_below = bool(re.search(r'or below|below \d+', question, re.IGNORECASE))
+            is_or_higher = bool(re.search(r'or higher|above \d+', question, re.IGNORECASE))
 
-            # NWS deviation boost: if our forecast deviates from NWS by 2°F+,
-            # the market is likely anchored to NWS and underreacting to our model.
-            # Boost EV to reflect this — market hasn't caught up yet.
-            # Only applies to US cities where we have NWS data.
-            if loc["region"] == "us" and abs(nws_deviation) >= 2:
-                ev_boost = 0.05  # add 5% EV as a nudge
-                ev_adjusted = ev + ev_boost
-                log.debug(
-                    "[NWS] %s deviation=%+d°F | adjusted EV: %.3f -> %.3f",
-                    city_slug, nws_deviation, ev, ev_adjusted
+            # ---------------------------------------------------------------
+            # GUARD: Skip unbounded buckets — these are lottery tickets, not
+            # structured trades. An unbounded bucket has no floor or ceiling,
+            # making position sizing via Kelly unreliable and the outcome
+            # dependent on extreme tail events. ColdMath never buys these.
+            # t_low=-999 means "X or below" (no lower bound).
+            # t_high=999 means "X or above" (no upper bound).
+            # Sell these if priced ≥ $0.85 (NARROW_SELL handles that below).
+            # ---------------------------------------------------------------
+            if t_low == -999.0 or t_high == 999.0:
+                pass  # Can't BUY unbounded buckets — fall through to SELL check
+            elif (ask <= self.cfg.max_price_cold
+                    and not is_single_degree
+                    and (is_or_below or self._is_cold_city_in_range(city_slug, fc_temp, t_low, t_high))):
+
+                p = bucket_prob(fc_temp, t_low, t_high, sigma)
+                ev = calc_ev(p, ask)
+
+                # Cold-event Kelly: use larger fraction for cheap entries
+                # ColdMath entered at $0.001-$0.015 and won 95%. His actual Kelly
+                # would have been tiny but he sized $5K-$13K. We use a hybrid:
+                # penny entries get 3-5% of balance (not scaled by Kelly).
+                kelly = calc_kelly_penny(p, ask, self.cfg.kelly_fraction)
+                # Skip garbage ticks: require minimum entry price of $0.05
+                # Entries below $0.05 have historically 0% win rate (lottery tickets)
+                # ColdMath entered at $0.02-$0.11 and won, but his calibration and
+                # city selection were far superior. With our current model, skip < $0.05.
+                if ask < 0.05:
+                    continue
+                balance = self.state.get_balance()
+                size = bet_size(kelly, balance, self.cfg.max_bet)
+                if size < 0.50:
+                    continue
+
+                shares = round(size / ask, 2) if ask > 0 else 0
+                norm_city = normalize_city(city_slug)
+                bucket_key = (norm_city, (t_low, t_high))
+                if bucket_key in open_buckets:
+                    continue
+
+                candidates.append({
+                    "type": "COLD_BUY",
+                    "id": m["id"],
+                    "city": norm_city,
+                    "date": m.get("date"),
+                    "bucket_low": t_low,
+                    "bucket_high": t_high,
+                    "entry_price": ask,
+                    "bid_at_entry": bid,
+                    "spread": spread,
+                    "shares": shares,
+                    "cost": round(shares * ask, 2),
+                    "p": round(p, 3),
+                    "ev": round(ev, 3),
+                    "kelly": round(kelly, 3),
+                    "forecast_temp": fc_temp,
+                    "forecast_src": best_src,
+                    "nws_forecast": nws_temp,
+                    "side": "BUY",
+                })
+
+            # ============================================================
+            # SIGNAL TYPE 2: NARROW-BUCKET SELL (market making / conviction)
+            # ============================================================
+            # Conditions:
+            # - Single-degree bucket (width ≤ 1°F/1°C) — our specialty
+            # - Price ≥ $0.85 — expensive, the other side is over-paying
+            # - Our forecast is CONFIDENTLY outside this bucket
+            #   (i.e., actual temp is very likely NOT in this 1-degree range)
+            # - NWS deviation boost if available
+            elif (is_single_degree
+                  and ask >= 0.85
+                  and not (t_low <= float(fc_temp) <= t_high)):
+                # We're confident the temp is OUTSIDE this narrow bucket
+                # The market is pricing it at $0.85-$0.99 because others think it'll hit
+                # We sell and collect premium. Max loss: if temp IS in the bucket,
+                # we pay (1 - ask) per share. For ask=0.91, loss = 0.09 × shares.
+
+                # Probability that forecast is WRONG about being outside: small
+                # Use 1 - p(outside) = p(inside) ≈ small number
+                p_inside = bucket_prob(fc_temp, t_low, t_high, sigma)
+                ev = calc_ev(1.0 - p_inside, 1.0 - ask)  # EV of selling
+
+                if ev < self.cfg.min_ev:
+                    continue
+
+                # SELL sizing: collect premium while capping downside
+                #
+                # Max loss  = shares × (1 - ask)  [we pay this if bucket hits]
+                # Premium   = shares × ask         [we collect this upfront]
+                #
+                # Kelly for SELL = (1-p_inside)/loss_per_unit - p_inside/gain_per_unit
+                # But for high-ask (0.85+) buckets, Kelly is dominated by the
+                # tiny loss-per-share denominator → inflated positions.
+                # Instead: cap shares at 150 regardless of ask, so:
+                #   max premium at ask=0.99: 150 × $0.99 = $148
+                #   max loss   at ask=0.99: 150 × $0.01 = $1.50
+                # → max loss ≤ $1.50, well within $20 budget
+                #
+                # ALSO enforce: min ask ≥ $0.10 (reject garbage ticks like $0.00)
+                # ALSO enforce: premium_collected ≥ $0.50 (meaningful trade)
+                # ALSO enforce: shares ≤ 150
+                if ask < 0.10:
+                    continue  # Garbage tick — skip
+
+                shares = min(
+                    round(self.cfg.max_bet / max(1.0 - ask, 0.01), 2),  # loss-based
+                    150,                                                  # hard cap
                 )
-                ev = ev_adjusted
+                premium_collected = round(shares * ask, 2)
+                if premium_collected < 0.50:
+                    continue  # Not worth the gas
 
-            if ev < self.cfg.min_ev:
-                continue
+                norm_city = normalize_city(city_slug)
+                bucket_key = (norm_city, (t_low, t_high))
+                if bucket_key in open_buckets:
+                    continue
 
-            kelly = calc_kelly(p, ask)
-            kelly = kelly * self.cfg.kelly_fraction  # fractional Kelly
-            balance = self.state.get_balance()
-            size = bet_size(kelly, balance, self.cfg.max_bet)
-            if size < 0.50:
-                continue
+                candidates.append({
+                    "type": "NARROW_SELL",
+                    "id": m["id"],
+                    "city": norm_city,
+                    "date": m.get("date"),
+                    "bucket_low": t_low,
+                    "bucket_high": t_high,
+                    "entry_price": ask,
+                    "bid_at_entry": bid,
+                    "spread": spread,
+                    "shares": shares,
+                    "cost": round(-shares * ask, 2),  # NEGATIVE: we RECEIVED this premium at open
+                    "p": round(p_inside, 3),
+                    "ev": round(ev, 3),
+                    "kelly": 0.0,  # sell side doesn't use Kelly
+                    "forecast_temp": fc_temp,
+                    "forecast_src": best_src,
+                    "nws_forecast": nws_temp,
+                    "side": "SELL",
+                })
 
-            shares = round(size / ask, 2) if ask > 0 else 0
-            return {
-                "id": m["id"],
-                "city": city_slug,
-                "date": m.get("date"),
-                "bucket_low": t_low,
-                "bucket_high": t_high,
-                "entry_price": ask,
-                "bid_at_entry": bid,
-                "spread": spread,
-                "shares": shares,
-                "cost": round(shares * ask, 2),
-                "p": round(p, 3),
-                "ev": round(ev, 3),
-                "kelly": round(kelly, 3),
-                "forecast_temp": forecast_temp,
-                "forecast_src": best_src,
-                "nws_forecast": nws_temp,
-            }
+        if not candidates:
+            return None
 
-        return None
+        # ---- NWS deviation boost ----
+        for c in candidates:
+            if loc["region"] == "us" and abs(nws_deviation) >= 2:
+                ev_boost = min(0.10, abs(nws_deviation) * 0.015)
+                old_ev = c["ev"]
+                c["ev"] = round(c["ev"] + ev_boost, 3)
+                log.debug(
+                    "[NWS] %s deviation=%+d°F | boost=%.3f | EV: %.3f -> %.3f",
+                    city_slug, nws_deviation, ev_boost, old_ev, c["ev"]
+                )
+
+        # ---- Filter by min_ev and select best ----
+        viable = [c for c in candidates if c["ev"] >= self.cfg.min_ev]
+        if not viable:
+            return None
+
+        # Prefer COLD_BUY over NARROW_SELL at same EV (safer edge)
+        viable.sort(key=lambda x: (x["ev"], 0 if x["type"] == "COLD_BUY" else 1), reverse=True)
+        best = viable[0]
+
+        log.info(
+            "[SIGNAL] %s %s %s | %s p=%.2f ev=%.2f %s $%.2f",
+            loc["name"], best["date"],
+            f"{fc_temp}°{unit}",
+            best["type"],
+            best["p"], best["ev"],
+            best["side"],
+            best["cost"],
+        )
+        return best
+
+    def _is_cold_city_in_range(self, city_slug: str, fc_temp: float,
+                                t_low: float, t_high: float) -> bool:
+        """
+        Is this a ColdMath-priority city with forecast in/near a cold bucket?
+        ColdMath bought pennies on spring cities that reliably get cold.
+        We check if the bucket is plausibly cold for that city in April.
+        """
+        cold_info = COLD_CITY_PRIORITY.get(city_slug)
+        if not cold_info:
+            return False
+
+        unit = LOCATIONS[city_slug].get("unit", "C")
+
+        # For "or below" buckets: check if threshold is at or below typical low
+        if unit == "C":
+            typical_low = cold_info.get("typical_low_c", 10)
+            typical_high = cold_info.get("typical_high_c", 20)
+        else:
+            typical_low = cold_info.get("typical_low_f", 40)
+            typical_high = cold_info.get("typical_high_f", 70)
+
+        # Bucket midpoint (handle unbounded)
+        if t_high == 999.0:  # "X or higher" — not a cold bucket
+            return False
+        if t_low == -999.0:  # "X or below"
+            # Cold bucket if threshold is near/at typical_low or below
+            return t_high <= typical_high
+        else:
+            # Range bucket — cold if entire range is at/below typical
+            return t_high <= typical_high
     def _check_close(self, pos_id: str, forecast_temp: float, markets: list[dict],
                      loc: dict, snap: dict) -> int:
         """Check if position should be closed for stop-loss, trailing stop, or forecast shift."""
@@ -370,14 +624,16 @@ class Scanner:
             return 0
 
         entry = pos["entry_price"]
-        stop = pos.get("stop_price", entry * 0.80)
+        stop = pos.get("stop_price") or (entry * 0.80)
         closed = 0
 
         if current_price <= stop:
             self.state.close_position(pos_id, current_price, "stop_loss")
             closed = 1
         elif current_price >= entry * 1.20 and stop < entry:
-            log.info("[TRAILING] %s stop moved to breakeven $%.3f", pos_id, entry)
+            # Trailing stop: lock in breakeven — price rose 20%+, move stop to entry
+            self.state.update_stop_price(pos_id, entry)
+            log.info("[TRAILING] %s stop updated to breakeven $%.3f", pos_id, entry)
         else:
             buffer = 2.0 if loc["unit"] == "F" else 1.0
             mid = (pos["bucket_low"] + pos["bucket_high"]) / 2
