@@ -35,6 +35,13 @@ class StateDB:
                 CREATE TABLE IF NOT EXISTS balance_log (
                     ts TEXT, balance REAL, delta REAL, reason TEXT
                 );
+                CREATE TABLE IF NOT EXISTS ecmwf_bias (
+                    city TEXT PRIMARY KEY,
+                    bias REAL,
+                    n INTEGER,
+                    rmse REAL,
+                    updated_at TEXT
+                );
                 CREATE TABLE IF NOT EXISTS nws_bias (
                     city TEXT,
                     month INTEGER,
@@ -73,6 +80,11 @@ class StateDB:
             # Migration: add side to resolved too
             try:
                 conn.execute("ALTER TABLE resolved ADD COLUMN side TEXT DEFAULT 'BUY'")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+            # Migration: add forecast_temp to resolved for bias calibration
+            try:
+                conn.execute("ALTER TABLE resolved ADD COLUMN forecast_temp REAL")
             except sqlite3.OperationalError:
                 pass  # column already exists
 
@@ -141,22 +153,30 @@ class StateDB:
             entry = pos_dict["entry_price"]
             side = pos_dict.get("side", "BUY")
 
-            # BUY:  cost = shares × entry (positive = we PAID at open)
-            #        balance at open: bal - cost  (deducted)
-            #        pnl = (exit - entry) × shares
-            #        close: return cost (unused) + pnl
+            # BUY:  cost = shares × entry (positive = cash paid at open)
+            #       balance at open: bal - cost  (deducted)
+            #       pnl = (exit - entry) × shares
+            #       close balance: bal - cost + pnl  =  bal + (exit - entry) × shares
             #
-            # SELL: cost = shares × entry (POSITIVE in positions, even for SELL)
-            #        balance at open: bal + cost  (premium ADDED to balance)
-            #        pnl = shares × (2×entry - 1) if YES wins
-            #            = shares × entry       if NO wins (we kept premium)
-            #        close: DEDUCT premium + pnl = -(cost) + pnl
+            # SELL: cost = -shares × entry (NEGATIVE = premium received at open)
+            #       balance at open: bal - cost = bal + shares × entry  (premium added)
+            #       premium = shares × entry
+            #       notional = shares  (cost to buy back at resolution)
+            #       pnl_win  = premium - notional  (net cost of settlement)
+            #       pnl_loss = premium             (we kept the premium, nothing else to pay)
+            #       close balance: bal - cost + pnl = bal + shares×entry + pnl
+            #       Simplifies to: bal + pnl (since bal already includes +premium from open)
+            premium = shares * entry
+            notional = shares
             if side == "SELL":
-                pnl = shares * (2.0 * entry - 1.0) if exit_price >= 0.95 else shares * entry
+                if exit_price >= 0.95:
+                    pnl = premium - notional   # WIN: we overpaid to close vs what we received
+                else:
+                    pnl = premium              # LOSS: we kept the full premium
             else:  # BUY
                 pnl = round((exit_price - entry) * shares, 2)
 
-            new_balance = self.get_balance() - cost + pnl
+            new_balance = self.get_balance() + pnl
             self.update_balance(new_balance, f"close:{reason}:{pos_id}")
 
             conn.execute(
@@ -166,8 +186,8 @@ class StateDB:
                 INSERT INTO resolved
                 (id, city, date, bucket_low, bucket_high, entry_price, exit_price,
                  shares, cost, resolved_outcome, pnl, resolved_at,
-                 forecast_src, nws_forecast, side)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 forecast_src, nws_forecast, side, forecast_temp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 pos_id, pos_dict["city"], pos_dict["date"],
                 pos_dict["bucket_low"], pos_dict["bucket_high"],
@@ -177,9 +197,9 @@ class StateDB:
                 pos_dict.get("forecast_src"),
                 pos_dict.get("nws_forecast"),
                 side,
+                pos_dict.get("forecast_temp"),
             ))
 
-            # ---- Calibration: update sigma from this resolve ----
             # ---- Calibration: update sigma from this resolve ----
             src = pos_dict.get("forecast_src")
             if src and pos_dict.get("forecast_temp") is not None and exit_price is not None:
@@ -284,6 +304,32 @@ class StateDB:
                 ON CONFLICT(city, source) DO UPDATE SET sigma=excluded.sigma,
                     n=excluded.n, updated_at=excluded.updated_at
             """, (city, source, sigma, n, datetime.now(timezone.utc).isoformat()))
+
+    # ---- ECMWF bias (auto-calibrated) ----
+    def get_ecmwf_bias(self, city: str) -> Optional[float]:
+        """Read validated ECMWF bias for a city from DB. Returns None if not yet calibrated."""
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT bias FROM ecmwf_bias WHERE city=?", (city,)
+            ).fetchone()
+        return row[0] if row else None
+
+    def get_all_ecmwf_biases(self) -> dict[str, float]:
+        """Read all validated ECMWF biases from DB."""
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute("SELECT city, bias FROM ecmwf_bias").fetchall()
+        return {city: bias for city, bias in rows}
+
+    def upsert_ecmwf_bias(self, city: str, bias: float, n: int, rmse: float):
+        """Store validated ECMWF bias after empirical calibration."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO ecmwf_bias (city, bias, n, rmse, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(city) DO UPDATE SET
+                    bias=excluded.bias, n=excluded.n, rmse=excluded.rmse,
+                    updated_at=excluded.updated_at
+            """, (city, bias, n, rmse, datetime.now(timezone.utc).isoformat()))
 
     # ---- NWS bias tracking ----
     def record_nws_bias(self, city: str, actual_temp: float,

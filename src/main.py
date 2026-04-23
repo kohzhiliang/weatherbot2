@@ -53,7 +53,8 @@ def main():
     if state.get_balance() == 0.0:
         state.update_balance(cfg.balance, "init")
 
-    fc = ForecastEngine(cfg.vc_key, cfg.disabled_sources)
+    fc = ForecastEngine(cfg.vc_key, cfg.disabled_sources,
+                        bias_provider=state.get_ecmwf_bias)
     pm = PolymarketClient()
     scanner = Scanner(cfg, state, fc, pm)
     whale_watcher = WhaleWatcher(DB_PATH, cfg)

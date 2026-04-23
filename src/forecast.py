@@ -1,5 +1,5 @@
 """Weather forecast engine — ECMWF via Open-Meteo, METAR real-time, NWS, Visual Crossing."""
-import time, logging, requests
+import time, logging, requests, threading
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -44,35 +44,43 @@ TIMEZONES = {
     "buenos-aires": "America/Argentina/Buenos_Aires", "wellington": "Pacific/Auckland",
 }
 
-# ColdMath research: ECMWF has systematic warm bias for Asian cities.
-# These biases are applied as a CORRECTION (subtract from ECMWF forecast).
-# Positive value = ECMWF runs warm, subtract it to get true forecast.
-# Empirical from ColdMath's historical wins + our 8 loss analysis:
-#   Singapore: +1.8°C bias (ECMWF 30°C → actual 31.3°C, ECMWF 28°C → actual 30.3°C)
-#   Shanghai: +0.8°C bias (ECMWF 20°C → actual 18.5°C... actually ECMWF runs cold here, so negative)
-#   Beijing, Seoul, Tokyo: +0.5 to +1.0°C warm bias typical
-# ColdMath won on: Wellington (spring), Seoul (winter cold), Tokyo (spring), Beijing (spring)
-# His strategy: buy extreme cold ("or below") pennies in spring for Southern Hemisphere / Asian cities.
+# ── ECMWF Bias Correction ──────────────────────────────────────────────────────
+# Positive = ECMWF runs cold (actual warmer than forecast → add correction)
+# Negative = ECMWF runs warm (actual colder than forecast → subtract correction)
+# Empirical values from ecmwf_bias_validator.py (auto-calibrated from resolved trades)
 ECMWF_BIAS_CORRECTION = {
-    "singapore": +1.8,
-    "shanghai": -0.8,   # ECMWF tends to run slightly cold on Shanghai
-    "seoul":    +1.0,
-    "tokyo":    +0.8,
-    "beijing":  +1.0,
-    "lucknow":  +1.2,
-    "tel-aviv": +0.8,
-    "manila":   +0.5,
-    "hong-kong": +0.7,  # approximate
-    "shenzhen": +0.7,
-    "chongqing": +0.5,
-    "chengdu":  +0.6,
-    "guangzhou": +0.5,
-    "busan":    +1.0,
-    # Southern Hemisphere / spring cities (April): cool bias more likely
-    "wellington": -0.5,
+    "ankara": +1.0,
+    "beijing": +2.0,
     "buenos-aires": -0.5,
+    "busan": +2.0,
+    "chengdu": +1.5,
+    "chongqing": +1.5,
+    "guangzhou": +1.5,
+    "helsinki": +0.5,
+    "hong-kong": +1.5,
+    "jakarta": +1.5,
+    "karachi": +2.0,
+    "lagos": +1.5,
+    "london": +1.0,
+    "lucknow": +2.4,  # empirically validated (3 samples)
+    "manila": +1.5,
+    "mexico-city": +1.5,
+    "munich": +0.5,
+    "paris": +1.0,
     "sao-paulo": -0.5,
+    "seoul": +4.9,  # empirically validated (3 samples)
+    "shanghai": -1.2,  # empirically validated (2 samples)
+    "shenzhen": +2.0,
+    "singapore": +5.5,  # empirically validated (4 samples)
+    "tel-aviv": +1.0,
+    "tokyo": +2.5,  # empirically validated (2 samples)
+    "toronto": +0.5,
+    "wellington": -0.9,  # empirically validated (3 samples)
 }
+
+# ColdMath cities — prioritized for cold-event strategy (spring 2026)
+
+# ColdMath cities — prioritized for cold-event strategy (spring 2026)
 
 # ColdMath cities — prioritized for cold-event strategy (spring 2026)
 # These cities reliably get cold enough in April that "or below" cold buckets
@@ -96,9 +104,17 @@ SIGMA_DEFAULTS = {"F": 2.0, "C": 1.2}
 class ForecastEngine:
     """Fetch weather forecasts from Open-Meteo (ECMWF + HRRR) and METAR."""
 
-    def __init__(self, vc_key: str = "", disabled_sources: list[str] | None = None):
+    def __init__(self, vc_key: str = "", disabled_sources: list[str] | None = None,
+                 bias_provider=None):
+        """
+        bias_provider: callable(city_slug) -> float bias, or None to use hardcoded table.
+                       Use state.get_ecmwf_bias for live DB-backed biases.
+        """
         self.vc_key = vc_key
         self.disabled_sources = disabled_sources or []
+        self._bias_provider = bias_provider
+        self._bias_cache: dict = {}
+        self._bias_cache_ts = 0.0
 
     def get_forecasts(self, city_slug: str, dates: list[str]) -> dict[str, dict]:
         """Returns {date: {ecmwf, hrrr, metar, best, best_source}}."""
@@ -153,6 +169,20 @@ class ForecastEngine:
             log.warning("[VC] %s %s: %s", city_slug, date_str, e)
         return None
 
+    def _get_bias(self, city_slug: str) -> float:
+        """Get ECMWF bias: DB value (if provider wired) > hardcoded table > 0."""
+        # Check DB bias first (refresh cache every 5 min)
+        if self._bias_provider:
+            import time
+            now = time.time()
+            if city_slug not in self._bias_cache or now - self._bias_cache_ts > 300:
+                self._bias_cache = {city_slug: self._bias_provider(city_slug)}
+                self._bias_cache_ts = now
+            db_bias = self._bias_cache.get(city_slug)
+            if db_bias is not None:
+                return db_bias
+        return ECMWF_BIAS_CORRECTION.get(city_slug, 0.0)
+
     def get_ecmwf(self, city_slug: str, dates: list[str]) -> dict[str, float]:
         """ECMWF via Open-Meteo. Airport coordinates = correct station match.
         
@@ -171,15 +201,18 @@ class ForecastEngine:
             f"&forecast_days=7&timezone={TIMEZONES.get(city_slug, 'UTC')}"
             f"&models=ecmwf_ifs025"
         )
-        bias = ECMWF_BIAS_CORRECTION.get(city_slug, 0.0)
+        bias = self._get_bias(city_slug)
+        # Bias table is in °C; convert to °F if forecast is Fahrenheit
+        if unit == "F":
+            bias = bias * 1.8  # Celsius → Fahrenheit conversion
         for attempt in range(3):
             try:
                 data = requests.get(url, timeout=(5, 10)).json()
                 if "error" not in data:
                     for date, temp in zip(data["daily"]["time"], data["daily"]["temperature_2m_max"]):
                         if date in dates and temp is not None:
-                            # Apply bias correction: positive bias = ECMWF warm, subtract it
-                            corrected = round(temp - bias, 1) if unit == "C" else round(temp - bias)
+                            # Apply bias correction: positive bias = ECMWF runs cold, add it
+                            corrected = round(temp + bias, 1)
                             result[date] = corrected
                             if bias != 0.0:
                                 log.debug(

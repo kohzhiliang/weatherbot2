@@ -1,5 +1,5 @@
 """Main scanning engine — orchestrates forecast + market data into trading decisions."""
-import logging, re, time
+import logging, re, time, threading
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,8 +20,9 @@ SCAN_TIMEOUT = 40  # seconds — total budget for full scan
 MAX_WORKERS = 8     # parallel threads for city processing
 METAR_CACHE_TTL = 300  # 5 minutes — METAR doesn't change fast
 
-# In-memory METAR cache keyed by city_slug
+# In-memory METAR cache keyed by city_slug (protected by _metar_lock)
 _metar_cache: dict[str, tuple[float, float]] = {}  # {city_slug: (temp, cached_at)}
+_metar_lock = threading.Lock()
 
 
 class Scanner:
@@ -88,6 +89,14 @@ class Scanner:
                              f"{actual_temp}°F" if actual_temp else "N/A",
                              f"{nws_fc}°F" if nws_fc else "N/A",
                              f"{model_fc}°F" if model_fc else "N/A")
+
+        # Auto-calibrate ECMWF bias if enough new resolutions have accumulated
+        try:
+            from ecmwf_bias_validator import maybe_update
+            if maybe_update(self.state, min_interval=12 * 3600, min_samples=3):
+                log.info("[BIAS] ECMWF bias auto-calibration updated")
+        except Exception as exc:
+            log.warning("[SCAN] Bias auto-calibration failed: %s", exc)
 
         elapsed = time.time() - scan_start
         log.info("[SCAN] done in %.1fs | new=%d closed=%d resolved=%d", elapsed, new_pos, closed, resolved)
@@ -206,17 +215,19 @@ class Scanner:
         return snapshots
 
     def _get_cached_metar(self, city_slug: str) -> Optional[float]:
-        """Return cached METAR temp if fresh (< 5 min old), else fetch fresh."""
+        """Return cached METAR temp if fresh (< 5 min old), else fetch fresh (thread-safe)."""
         now = time.time()
-        if city_slug in _metar_cache:
-            temp, cached_at = _metar_cache[city_slug]
-            if now - cached_at < METAR_CACHE_TTL:
-                return temp
+        with _metar_lock:
+            if city_slug in _metar_cache:
+                temp, cached_at = _metar_cache[city_slug]
+                if now - cached_at < METAR_CACHE_TTL:
+                    return temp
 
-        # Fetch fresh
+        # Fetch fresh (outside lock to avoid blocking)
         metar = self.fc.get_metar(city_slug)
         if metar is not None:
-            _metar_cache[city_slug] = (metar, now)
+            with _metar_lock:
+                _metar_cache[city_slug] = (metar, now)
         return metar
 
     # -------------------------------------------------------------------------
@@ -714,6 +725,7 @@ class Scanner:
             self.state.close_position(pos_id, current_price, "stop_loss")
             closed = 1
         elif current_price >= entry * 1.20 and stop < entry:
+            self.state.update_stop_price(pos_id, entry)
             log.info("[TRAILING] %s stop moved to breakeven $%.3f", pos_id, entry)
         else:
             buffer = 2.0 if loc["unit"] == "F" else 1.0
