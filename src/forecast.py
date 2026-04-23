@@ -96,8 +96,9 @@ SIGMA_DEFAULTS = {"F": 2.0, "C": 1.2}
 class ForecastEngine:
     """Fetch weather forecasts from Open-Meteo (ECMWF + HRRR) and METAR."""
 
-    def __init__(self, vc_key: str = ""):
+    def __init__(self, vc_key: str = "", disabled_sources: list[str] | None = None):
         self.vc_key = vc_key
+        self.disabled_sources = disabled_sources or []
 
     def get_forecasts(self, city_slug: str, dates: list[str]) -> dict[str, dict]:
         """Returns {date: {ecmwf, hrrr, metar, best, best_source}}."""
@@ -109,7 +110,9 @@ class ForecastEngine:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         snapshots = {}
         for date in dates:
-            metar = self.get_metar(city_slug) if date == today else None
+            metar = None
+            if date == today and "metar" not in self.disabled_sources:
+                metar = self.get_metar(city_slug)
             if loc["unit"] == "F" and hrrr.get(date) is not None:
                 best, best_src = hrrr[date], "hrrr"
             elif ecmwf.get(date) is not None:
