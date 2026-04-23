@@ -169,7 +169,7 @@ class ForecastEngine:
             f"?latitude={loc['lat']}&longitude={loc['lon']}"
             f"&daily=temperature_2m_max&temperature_unit={temp_unit}"
             f"&forecast_days=7&timezone={TIMEZONES.get(city_slug, 'UTC')}"
-            f"&models=ecmwf_ifs025&bias_correction=true"
+            f"&models=ecmwf_ifs025"
         )
         bias = ECMWF_BIAS_CORRECTION.get(city_slug, 0.0)
         for attempt in range(3):

@@ -184,11 +184,15 @@ class StateDB:
             src = pos_dict.get("forecast_src")
             if src and pos_dict.get("forecast_temp") is not None and exit_price is not None:
                 bucket_width = abs(pos_dict["bucket_high"] - pos_dict["bucket_low"])
-                bucket_mid = (pos_dict["bucket_low"] + pos_dict["bucket_high"]) / 2.0
-                if bucket_mid == -999:
-                    bucket_mid = pos_dict["bucket_high"]  # unbounded bucket
+                if bucket_width == 0 or bucket_width >= 998:
+                    # Unbounded bucket: use the bounded edge as the forecast reference
+                    # "X or below": use t_high (the X threshold)
+                    # "X or above": use t_low (the X threshold)
+                    ref = pos_dict["bucket_high"] if pos_dict["bucket_low"] == -999.0 else pos_dict["bucket_low"]
+                else:
+                    ref = (pos_dict["bucket_low"] + pos_dict["bucket_high"]) / 2.0
                 fcst = pos_dict["forecast_temp"]
-                raw_error = abs(fcst - bucket_mid)
+                raw_error = abs(fcst - ref)
                 # Minimum error floor: prevent wins on single-degree buckets (where
                 # fcst == bucket_mid exactly) from driving sigma toward zero.
                 # A win means we were in the right bucket — but actual could have been
