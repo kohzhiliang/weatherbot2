@@ -326,10 +326,17 @@ class Scanner:
             is_or_below = bool(re.search(r"or below|below \d+", question, re.IGNORECASE))
             is_unbounded = (t_low == -999.0 or t_high == 999.0)
 
-            # Classify market type for COLD_SELL signal
-            # LOW_MIN: forecast below bucket_low (bucket is "X or above" priced high — overbought by optimists)
-            # HIGH_MAX: forecast above bucket_high (bucket is "X or below" priced high — overbought by cold-huggers)
-            # RANGE: forecast inside bucket
+            # Market classification by bucket structure (determines if it's "highest X" or "lowest X")
+            # "highest X or above": t_low = X, t_high = 999  (YES if temp >= X)
+            # "lowest X or below":  t_low = -999, t_high = X  (YES if temp <= X)
+            is_highest_bucket = (t_low != -999.0 and t_high == 999.0)   # "X or above"
+            is_lowest_bucket  = (t_low == -999.0 and t_high != 999.0)   # "X or below"
+            is_between_bucket = (t_low != -999.0 and t_high != 999.0)    # "between X and Y"
+
+            # Market type by forecast vs bucket (for SELL signals)
+            # LOW_MIN:  forecast < bucket_low  — optimistic market overbuying "X or above"
+            # HIGH_MAX:  forecast > bucket_high — pessimistic market overbuying "X or below"
+            # RANGE:     forecast inside bucket
             market_type = "RANGE"
             if forecast_temp is not None:
                 if forecast_temp < t_low:
@@ -394,7 +401,66 @@ class Scanner:
                 continue
 
             # ---------------------------------------------------------------
-            # SIGNAL TYPE 2: NARROW-BUCKET SELL
+            # SIGNAL TYPE 2: HOT-EVENT BUY
+            # Buy bounded "X or above" (highest bucket) at penny prices ($0.02 or less).
+            # ColdMath core edge: market underestimates how often temperatures
+            # stay BELOW a high threshold. Buy cheap "highest 30C" YES when ECMWF
+            # says 28C — the bucket pays out if temp stays at or below 30C.
+            # Pattern: is_highest_bucket + bounded + forecast >= t_low + NOT cold city.
+            # Penny cap: $0.02 max entry (ColdMath avg was $0.011).
+            # ---------------------------------------------------------------
+            if (is_highest_bucket
+                    and not is_single_degree
+                    and not is_unbounded
+                    and ask <= 0.02
+                    and forecast_temp is not None
+                    and forecast_temp >= t_low
+                    and not self._is_cold_city_in_range(city_slug, forecast_temp, t_low, t_high)):
+
+                p = bucket_prob(forecast_temp, t_low, t_high, sigma)
+
+                if p < 0.01:
+                    continue  # P2: skip lottery tickets
+
+                if p < 0.05:
+                    kelly = calc_kelly_penny(p, ask, self.cfg.kelly_fraction)
+                else:
+                    kelly = calc_kelly(p, ask) * self.cfg.kelly_fraction
+
+                ev = calc_ev(p, ask)
+                if ev < self.cfg.min_ev:
+                    continue
+
+                balance = self.state.get_balance()
+                size = bet_size(kelly, balance, self.cfg.max_bet_conviction)
+                if size < 0.50:
+                    continue
+
+                shares = round(size / ask, 2) if ask > 0 else 0
+                candidates.append({
+                    "type": "HOT_BUY",
+                    "id": m["id"],
+                    "city": city_slug,
+                    "date": m.get("date"),
+                    "bucket_low": t_low,
+                    "bucket_high": t_high,
+                    "entry_price": ask,
+                    "bid_at_entry": bid,
+                    "spread": spread,
+                    "shares": shares,
+                    "cost": round(shares * ask, 2),
+                    "p": round(p, 3),
+                    "ev": round(ev, 3),
+                    "kelly": round(kelly, 3),
+                    "forecast_temp": forecast_temp,
+                    "forecast_src": best_src,
+                    "nws_forecast": nws_temp,
+                    "side": "BUY",
+                })
+                continue
+
+            # ---------------------------------------------------------------
+            # SIGNAL TYPE 3: NARROW-BUCKET SELL
             # Sell single-degree buckets priced ≥ $0.85 where we're confident
             # the temp is OUTSIDE this bucket.
             # ---------------------------------------------------------------
@@ -460,27 +526,26 @@ class Scanner:
                 continue
 
             # ---------------------------------------------------------------
-            # SIGNAL TYPE 3: COLD SELL (HIGH_MAX — forecast above bucket)
-            # When forecast exceeds the bucket high, the market is overestimating
-            # the chance of the lower bucket. Sell the HIGH_MAX bucket.
-            # e.g. bucket is "31°C or below" trading at $0.75, but ECMWF says 33°C.
-            # Only for cold cities where we have conviction, and only at ≥$0.70.
-            # P1: max_bet_conviction=$50 for cold-city conviction trades.
+            # SIGNAL TYPE 4: HOT SELL (LOW_MIN — forecast below bucket)
+            # When forecast is below the bucket low, the market is overestimating
+            # how HIGH temperatures will go. Sell the "highest X or above" bucket.
+            # e.g. bucket is "highest 30C or above" trading at $0.75, but ECMWF says 26C.
+            # Only for warm cities (not cold cities), forecast below bucket_low, at ≥$0.70.
+            # P1: max_bet_conviction=$50 for conviction sells.
             # ---------------------------------------------------------------
-            if (market_type == "HIGH_MAX"
+            if (market_type == "LOW_MIN"
                     and not is_unbounded
-                    and self._is_cold_city_in_range(city_slug, forecast_temp, t_low, t_high)
+                    and not self._is_cold_city_in_range(city_slug, forecast_temp, t_low, t_high)
                     and ask >= 0.70):
 
-                p_above = 1.0 - bucket_prob(forecast_temp, t_low, t_high, sigma)
-                ev = calc_ev(p_above, 1.0 - ask)
+                p_below = 1.0 - bucket_prob(forecast_temp, t_low, t_high, sigma)
+                ev = calc_ev(p_below, 1.0 - ask)
 
                 if ev < self.cfg.min_ev:
                     continue
 
-                kelly = calc_kelly(p_above, 1.0 - ask) * self.cfg.kelly_fraction
+                kelly = calc_kelly(p_below, 1.0 - ask) * self.cfg.kelly_fraction
                 balance = self.state.get_balance()
-                # P1: use conviction cap for cold-city sells
                 size = bet_size(kelly, balance, self.cfg.max_bet_conviction)
                 if size < 0.50:
                     continue
@@ -500,7 +565,7 @@ class Scanner:
                     continue  # Not worth the gas
 
                 candidates.append({
-                    "type": "COLD_SELL",
+                    "type": "HOT_SELL",
                     "id": m["id"],
                     "city": city_slug,
                     "date": m.get("date"),
@@ -511,7 +576,7 @@ class Scanner:
                     "spread": spread,
                     "shares": shares,
                     "cost": round(-shares * ask, 2),
-                    "p": round(p_above, 3),
+                    "p": round(p_below, 3),
                     "ev": round(ev, 3),
                     "kelly": round(kelly, 3),
                     "forecast_temp": forecast_temp,
@@ -522,7 +587,7 @@ class Scanner:
                 continue
 
             # ---------------------------------------------------------------
-            # SIGNAL TYPE 4: CONVICTION BUY (standard bounded buckets, p > 0.05)
+            # SIGNAL TYPE 5: CONVICTION BUY (standard bounded buckets, p > 0.05)
             # Standard Kelly on bounded buckets where we're confident.
             # P1: max_bet_conviction=$50 for high-conviction entries.
             # ---------------------------------------------------------------
