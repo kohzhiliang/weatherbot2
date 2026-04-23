@@ -326,10 +326,22 @@ class Scanner:
             is_or_below = bool(re.search(r"or below|below \d+", question, re.IGNORECASE))
             is_unbounded = (t_low == -999.0 or t_high == 999.0)
 
+            # Classify market type for COLD_SELL signal
+            # LOW_MIN: forecast below bucket_low (bucket is "X or above" priced high — overbought by optimists)
+            # HIGH_MAX: forecast above bucket_high (bucket is "X or below" priced high — overbought by cold-huggers)
+            # RANGE: forecast inside bucket
+            market_type = "RANGE"
+            if forecast_temp is not None:
+                if forecast_temp < t_low:
+                    market_type = "LOW_MIN"
+                elif forecast_temp > t_high:
+                    market_type = "HIGH_MAX"
+
             # ---------------------------------------------------------------
             # SIGNAL TYPE 1: COLD-EVENT BUY
             # Buy bounded "X or below" buckets at cheap prices (≤ max_price_cold).
             # Skip unbounded buckets — ColdMath never buys these.
+            # Skip single-degree buckets at <$0.70 — only trade narrow buckets as SELLs.
             # ---------------------------------------------------------------
             if (ask <= self.cfg.max_price_cold
                     and not is_single_degree
@@ -353,7 +365,8 @@ class Scanner:
                     continue
 
                 balance = self.state.get_balance()
-                size = bet_size(kelly, balance, self.cfg.max_bet)
+                # P1: COLD_BUY uses max_bet_conviction ($50) for cold-city conviction trades
+                size = bet_size(kelly, balance, self.cfg.max_bet_conviction)
                 if size < 0.50:
                     continue
 
@@ -447,8 +460,71 @@ class Scanner:
                 continue
 
             # ---------------------------------------------------------------
-            # SIGNAL TYPE 3: CONVICTION BUY (standard bounded buckets, p > 0.05)
+            # SIGNAL TYPE 3: COLD SELL (HIGH_MAX — forecast above bucket)
+            # When forecast exceeds the bucket high, the market is overestimating
+            # the chance of the lower bucket. Sell the HIGH_MAX bucket.
+            # e.g. bucket is "31°C or below" trading at $0.75, but ECMWF says 33°C.
+            # Only for cold cities where we have conviction, and only at ≥$0.70.
+            # P1: max_bet_conviction=$50 for cold-city conviction trades.
+            # ---------------------------------------------------------------
+            if (market_type == "HIGH_MAX"
+                    and not is_unbounded
+                    and self._is_cold_city_in_range(city_slug, forecast_temp, t_low, t_high)
+                    and ask >= 0.70):
+
+                p_above = 1.0 - bucket_prob(forecast_temp, t_low, t_high, sigma)
+                ev = calc_ev(p_above, 1.0 - ask)
+
+                if ev < self.cfg.min_ev:
+                    continue
+
+                kelly = calc_kelly(p_above, 1.0 - ask) * self.cfg.kelly_fraction
+                balance = self.state.get_balance()
+                # P1: use conviction cap for cold-city sells
+                size = bet_size(kelly, balance, self.cfg.max_bet_conviction)
+                if size < 0.50:
+                    continue
+
+                shares = round(size / ask, 2) if ask > 0 else 0
+                premium_collected = round(shares * ask, 2)
+                max_loss = round(shares * (1.0 - ask), 2)
+
+                # P2: enforce max_loss ≤ 2× premium
+                if max_loss > 2 * premium_collected:
+                    shares = round(2 * premium_collected / max(1.0 - ask, 0.01), 2)
+                    shares = max(shares, 1)
+                    max_loss = round(shares * (1.0 - ask), 2)
+                    premium_collected = round(shares * ask, 2)
+
+                if premium_collected < 0.50:
+                    continue  # Not worth the gas
+
+                candidates.append({
+                    "type": "COLD_SELL",
+                    "id": m["id"],
+                    "city": city_slug,
+                    "date": m.get("date"),
+                    "bucket_low": t_low,
+                    "bucket_high": t_high,
+                    "entry_price": ask,
+                    "bid_at_entry": bid,
+                    "spread": spread,
+                    "shares": shares,
+                    "cost": round(-shares * ask, 2),
+                    "p": round(p_above, 3),
+                    "ev": round(ev, 3),
+                    "kelly": round(kelly, 3),
+                    "forecast_temp": forecast_temp,
+                    "forecast_src": best_src,
+                    "nws_forecast": nws_temp,
+                    "side": "SELL",
+                })
+                continue
+
+            # ---------------------------------------------------------------
+            # SIGNAL TYPE 4: CONVICTION BUY (standard bounded buckets, p > 0.05)
             # Standard Kelly on bounded buckets where we're confident.
+            # P1: max_bet_conviction=$50 for high-conviction entries.
             # ---------------------------------------------------------------
             if (not is_single_degree
                     and not is_unbounded
@@ -465,7 +541,8 @@ class Scanner:
 
                 kelly = calc_kelly(p, ask) * self.cfg.kelly_fraction
                 balance = self.state.get_balance()
-                size = bet_size(kelly, balance, self.cfg.max_bet)
+                # P1: CONVICTION_BUY uses $50 cap (max_bet_conviction)
+                size = bet_size(kelly, balance, self.cfg.max_bet_conviction)
                 if size < 0.50:
                     continue
 
